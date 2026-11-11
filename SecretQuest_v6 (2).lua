@@ -24,19 +24,6 @@ SQToast = function(text, dur)
     end)
 end
 
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService = game:GetService("TweenService")
-local RunService = game:GetService("RunService")
-local VirtualInputManager = game:GetService("VirtualInputManager")
-local VirtualUser = game:GetService("VirtualUser")
-local CollectionService = game:GetService("CollectionService")
-local HttpService = game:GetService("HttpService")
-local TeleportService = game:GetService("TeleportService")
-local Lighting = game:GetService("Lighting")
-
-local localPlayer = Players.LocalPlayer or Players:GetPropertyChangedSignal("LocalPlayer"):Wait() and Players.LocalPlayer
-
 local sharedEnv = (type(getgenv) == "function" and getgenv()) or _G
 local currentJobId = tostring(game.JobId)
 
@@ -49,7 +36,20 @@ sharedEnv.SecretQuestJobLock = currentJobId
 sharedEnv.SecretQuestLoaded = true
 sharedEnv.SecretQuestJobId = currentJobId
 
--- Wait for Data + Main + Remotes all at once (no fixed delays)
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local VirtualUser = game:GetService("VirtualUser")
+local CollectionService = game:GetService("CollectionService")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local Lighting = game:GetService("Lighting")
+
+local localPlayer = Players.LocalPlayer
+
+-- Wait for Data + PlayerGui/Main + Remotes without any fixed delay
 do
     local playerGui = localPlayer:FindFirstChildOfClass("PlayerGui")
         or localPlayer:WaitForChild("PlayerGui", 10)
@@ -63,48 +63,37 @@ do
         task.wait(0.1)
     end
 end
-
 local CommF = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CommF_")
 
--- Suppress the blue-screen effect that Observation/Ken puts in Lighting.
--- The ObservationManager:refresh() adds a Blur and a ColorCorrection every frame;
--- we kill them on ChildAdded AND wipe any already present, then hook the GC object
--- so its internal blur/colorCorrection fields are neutered.
-local function killLightingEffect(child)
-    pcall(function()
-        if child:IsA("BlurEffect") then
-            child.Size = 0
-            child.Enabled = false
-        elseif child:IsA("ColorCorrectionEffect") then
-            child.Brightness = 0
-            child.Contrast  = 0
-            child.Saturation = 0
-            child.TintColor  = Color3.new(1,1,1)
-            child.Enabled    = false
-        end
-    end)
+-- Suppress blue-screen from Ken/Observation: hook every Blur/ColorCorrection added to Lighting
+local _hookedFX = {}
+local function _hookFX(child)
+    if _hookedFX[child] then return end
+    _hookedFX[child] = true
+    local function _zero()
+        pcall(function()
+            if child:IsA("BlurEffect") then
+                child.Size = 0; child.Enabled = false
+            elseif child:IsA("ColorCorrectionEffect") then
+                child.Brightness = 0; child.Contrast = 0
+                child.Saturation = 0; child.TintColor = Color3.new(1,1,1)
+                child.Enabled = false
+            end
+        end)
+    end
+    _zero()
+    child.Changed:Connect(_zero)
 end
--- Kill anything already in Lighting
-for _, child in ipairs(Lighting:GetChildren()) do killLightingEffect(child) end
--- Kill anything added later (ObservationManager adds them on first refresh)
-Lighting.ChildAdded:Connect(killLightingEffect)
--- Also null out the blur/cc fields on the ObservationManager GC table so refresh() is a no-op for visuals
+for _, c in ipairs(Lighting:GetChildren()) do _hookFX(c) end
+Lighting.ChildAdded:Connect(_hookFX)
 task.defer(function()
-    local ok = pcall(function()
+    pcall(function()
         for _, v in ipairs(getgc(false)) do
             if type(v) == "table" then
-                local b = rawget(v, "blur")
+                local b  = rawget(v, "blur")
                 local cc = rawget(v, "colorCorrection")
-                if b and typeof(b) == "Instance" and b:IsA("BlurEffect") then
-                    b.Size    = 0
-                    b.Enabled = false
-                end
-                if cc and typeof(cc) == "Instance" and cc:IsA("ColorCorrectionEffect") then
-                    cc.Brightness = 0
-                    cc.Contrast   = 0
-                    cc.Saturation = 0
-                    cc.Enabled    = false
-                end
+                if b  and typeof(b)  == "Instance" then _hookFX(b)  end
+                if cc and typeof(cc) == "Instance" then _hookFX(cc) end
             end
         end
     end)
@@ -326,22 +315,10 @@ local function EnsureSelectedTeam(force)
 end
 
 task.spawn(function()
-    -- Try immediately; keep retrying until team is set, then switch to a slow background loop
-    local playerGui = localPlayer:FindFirstChildOfClass("PlayerGui")
-    local function dataReady()
-        return localPlayer:FindFirstChild("Data")
-            and playerGui and playerGui:FindFirstChild("Main")
-    end
-    -- Fast loop until team confirmed or data never loads (max 15s)
-    local deadline = tick() + 15
-    while tick() < deadline do
-        if EnsureSelectedTeam(false) then break end
-        task.wait(0.3)
-    end
-    -- Slow background loop to re-apply if team gets reset (e.g. respawn, server hop)
+    task.wait(0.5)
     while true do
-        task.wait(2)
         EnsureSelectedTeam(false)
+        task.wait(2)
     end
 end)
 
@@ -1376,21 +1353,8 @@ local function HasBusoOn()
 end
 
 local function ObservationOn()
-    -- Check the ObservationManager active state via GC instead of the Blur
-    -- (we disable Blur to avoid the blue screen, so it's no longer a reliable signal)
-    local ok, result = pcall(function()
-        for _, v in ipairs(getgc(false)) do
-            if type(v) == "table" then
-                local active = rawget(v, "active")
-                local radius = rawget(v, "radius")
-                if type(active) == "boolean" and type(radius) == "number" then
-                    return active
-                end
-            end
-        end
-        return false
-    end)
-    return ok and result or false
+    local blur = Lighting:FindFirstChild("Blur")
+    return blur and blur.Enabled or false
 end
 
 local function TurnOnV3()
@@ -7668,7 +7632,7 @@ local min = UTCNow().min
             HiddenEvent.deadHourIdleSince = HiddenEvent.deadHourIdleSince or tick()
             local deadIdle = tick() - HiddenEvent.deadHourIdleSince
 
-            if deadIdle >= 10 and tick() - (HiddenEvent.hopAt or 0) >= 10 then
+            if deadIdle >= 1 and tick() - (HiddenEvent.hopAt or 0) >= 3 then
                 HiddenEvent.hopAt = tick()
                 HiddenEvent.deadHourIdleSince = nil
 
@@ -8220,7 +8184,7 @@ task.spawn(function()
                 return
             end
             deadSince = deadSince or os.clock()
-            if os.clock() - deadSince >= 6 and os.clock() - lastHop >= 20 then
+            if os.clock() - deadSince >= 1 and os.clock() - lastHop >= 3 then
                 lastHop, deadSince = os.clock(), nil
                 HopHiddenServer("Dead hour: no needed awakened boss in this server")
             end

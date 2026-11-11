@@ -111,7 +111,7 @@ local Settings = {
     ["Tween Speed"] = DEFAULT_TWEEN_SPEED,
     ["Use Portal Fruit Teleport"] = false,
     ["Hidden Hop Dead Hour"] = true,
-    ["Hop Until Quest"] = false,
+    ["Hop Until Quest"] = true,
     ["Select Bait"] = "Basic Bait",
     ["Anti AFK"] = true,
     ["Auto Turn On Buso"] = true,
@@ -883,7 +883,13 @@ local function startProxyTween(goal,speed)
 
     if MoveState.Active and not MoveState.Hold and MoveState.Goal and MoveState.Tween
         and (MoveState.Goal.Position-goal.Position).Magnitude<3 then
-        return true
+        local playing = true
+        pcall(function() playing = MoveState.Tween.PlaybackState == Enum.PlaybackState.Playing end)
+        local expired = (tick() - (MoveState.StartedAt or 0)) > ((MoveState.Duration or 0) + 3)
+        if playing and not expired and MoveState.Proxy and MoveState.Proxy.Parent then
+            return true
+        end
+        -- the tween ended (or the proxy vanished) without clearing the state: restart it below
     end
 
     stopMove(true)
@@ -905,6 +911,8 @@ local function startProxyTween(goal,speed)
     local duration=math.max(dist/actualSpeed,0.05)
     local tw=TweenService:Create(proxy,TweenInfo.new(duration,Enum.EasingStyle.Linear,Enum.EasingDirection.Out),{CFrame=goal})
     MoveState.Tween=tw
+    MoveState.StartedAt=tick()
+    MoveState.Duration=duration
     Runtime.CurrentTween=tw
     Runtime.TweenGoal=goal
     tbl3.LastCall=tick()
@@ -1600,12 +1608,15 @@ end
     end
 
     HiddenGoToIsland = function(arg)
-        local v6 = GetHiddenIsland(arg)
-        if not v6 then
-            return
+        local ok6, v6 = pcall(GetHiddenIsland, arg)
+        if not ok6 or not v6 then
+            HiddenEvent.islandMissing = arg
+            return false
         end
+        HiddenEvent.islandMissing = nil
         SetHiddenStep("Travel to " .. arg)
-        local position = v6.TeleportPoints[1].Position
+        local firstPoint = v6.TeleportPoints and v6.TeleportPoints[1]
+        local position = (firstPoint and firstPoint.Position) or v6.World.Position
         local v7 = nil
 
         for _, child in ipairs(workspace._WorldOrigin.Locations:GetChildren()) do
@@ -1619,6 +1630,7 @@ end
             end
         end
 
+        HiddenEvent.travelTarget = position + Vector3.new(0, 30, 0)
         return HiddenGoTo(position + Vector3.new(0, 30, 0), 150)
     end
 
@@ -7473,7 +7485,11 @@ if v11.stage == "Pickup" and v11.pickup then
                 end
 
                 if flag6 then
-                    if HiddenGoToIsland(v8.Island) then
+                    local arrivedAtIsland = HiddenGoToIsland(v8.Island)
+                    if SQTravelWatchdog(v8, arrivedAtIsland) then
+                        return
+                    end
+                    if arrivedAtIsland then
                         HiddenEvent.islandArrived = HiddenEvent.islandArrived or tick()
                         local islandArrived = HiddenEvent.islandArrived
 
@@ -7580,10 +7596,7 @@ if v11.stage == "Pickup" and v11.pickup then
                 v8 = v9
             end
         end
-if PrepareHiddenChef(v6) then
-            return
-        end
-        local min = UTCNow().min
+local min = UTCNow().min
         local deadHour = Settings["Hidden Hop Dead Hour"] ~= false and min >= 50 and min <= 58
 
         local neededHintQuest = FindNeededAwakenedQuest(v6, v7)
@@ -7608,6 +7621,10 @@ if PrepareHiddenChef(v6) then
             end
         else
             HiddenEvent.deadHourIdleSince = nil
+        end
+
+        if PrepareHiddenChef(v6) then
+            return
         end
 
         -- Hop until a quest is available (quests already completed are never candidates)
@@ -7818,6 +7835,7 @@ HopHiddenServer = function(reason)
     end
 
     Runtime.HopInProgress = true
+    Runtime.HopStartedAt = tick()
     Runtime.Status = reason or "Server hopping"
 
     cancelTween()
@@ -8055,6 +8073,101 @@ HopHiddenServer = function(reason)
 
     return true
 end
+
+
+-- Travel watchdog: if the character is not really moving toward an island, retry, then skip the quest
+SQTravelWatchdog = function(quest, arrived)
+    local HE = HiddenEvent
+    if not arrived and HE.islandMissing == quest.Island then
+        HE.skipped[quest.Name] = tick() + 120
+        HE.current = nil
+        HE.travelKey = nil
+        HiddenNotify("Island \"" .. tostring(quest.Island) .. "\" was not found in the map data, skipping " .. quest.Name,
+            "noisland" .. tostring(quest.Island), "warning")
+        return true
+    end
+    if arrived then
+        HE.travelKey = nil
+        Runtime.Diag = nil
+        return false
+    end
+    local root = SafeRoot()
+    if not root then
+        return false
+    end
+    if HE.travelKey ~= quest.Name then
+        HE.travelKey = quest.Name
+        HE.travelLastPos = root.Position
+        HE.travelProgressAt = tick()
+        HE.travelRetries = 0
+    end
+    if (root.Position - HE.travelLastPos).Magnitude > 15 then
+        HE.travelLastPos = root.Position
+        HE.travelProgressAt = tick()
+    end
+    local target = HE.travelTarget
+    Runtime.Diag = ("travel %s | dist %s | tween %s | retries %d"):format(
+        tostring(quest.Island),
+        target and tostring(math.floor((root.Position - target).Magnitude)) or "?",
+        (MoveState.Active and not MoveState.Hold) and "on" or "off",
+        HE.travelRetries or 0)
+    if tick() - HE.travelProgressAt > 6 then
+        HE.travelRetries = (HE.travelRetries or 0) + 1
+        HE.travelProgressAt = tick()
+        pcall(cancelTween) -- kills a stale tween; the next tick builds a fresh one
+        if HE.travelRetries >= 3 then
+            HE.skipped[quest.Name] = tick() + 180
+            HE.current = nil
+            HE.travelKey = nil
+            HiddenNotify("Could not travel to " .. tostring(quest.Island) .. " (not moving), skipping " .. quest.Name,
+                "stucktravel" .. quest.Name, "warning")
+            return true
+        end
+    end
+    return false
+end
+
+-- Dead-hour watcher: runs on its own, so it no longer depends on the quest loop reaching its idle branch
+task.spawn(function()
+    local deadSince, lastHop = nil, 0
+    while task.wait(1) do
+        pcall(function()
+            if not Settings["Auto Secret Quest"] or Settings["Hidden Hop Dead Hour"] == false
+                or Runtime.HopInProgress or SecretQuestAutoSCProgressSea() ~= 1 then
+                deadSince = nil
+                return
+            end
+            local t = UTCNow()
+            if t.min < 50 or t.min > 58 or (t.min == 50 and t.sec < 15) then
+                deadSince = nil
+                return
+            end
+            local progress = GetHiddenProgress()
+            if CountSecretDone(progress) >= 39 or IsHiddenTaskLockValid(progress) or HiddenEvent.fighting then
+                deadSince = nil
+                return
+            end
+            local pending = false
+            local allowed = HiddenEvent.manualAllowedTasks
+            for _, q in ipairs(HiddenQuests or {}) do
+                if q.BossNames and (not allowed or allowed[q.Name])
+                    and progress["Sea1/" .. tostring(q.Island) .. "/" .. q.Name] ~= true then
+                    pending = true
+                    break
+                end
+            end
+            if not pending or FindNeededAwakenedQuest(progress, GetHiddenRaidHint()) then
+                deadSince = nil -- nothing to find, or a needed boss is hinted here: stay
+                return
+            end
+            deadSince = deadSince or os.clock()
+            if os.clock() - deadSince >= 6 and os.clock() - lastHop >= 20 then
+                lastHop, deadSince = os.clock(), nil
+                HopHiddenServer("Dead hour: no needed awakened boss in this server")
+            end
+        end)
+    end
+end)
 
 local function FindQuest(name)
     for _,q in ipairs(HiddenQuests or {}) do if q.Name==name then return q end end
@@ -8431,6 +8544,18 @@ end
 
 local BaseAutoHiddenEvent=AutoHiddenEvent
 AutoHiddenEvent=function()
+    if Runtime.HopInProgress then
+        if tick() - (Runtime.HopStartedAt or tick()) > 150 then
+            Runtime.HopInProgress = false
+            Runtime.Status = "Hop timed out, resuming quests"
+        else
+            return
+        end
+    end
+    if not SafeRoot() then
+        Runtime.Status = "Waiting for character"
+        return
+    end
     local progress=GetHiddenProgress()
     local done=CountSecretDone(progress)
     local manualQueue = HiddenEvent.manualSelectionOrder
@@ -8496,10 +8621,10 @@ CheckHiddenStall=function()
         pcall(HiddenRelease);
         cancelTween()
     end
-    if idle>=600 then
+    if idle>=240 then
         Runtime.LastMeaningfulProgress=tick();
-        Runtime.Status="Hard stuck 10m: hopping server"
-        HopHiddenServer("10 minute hard-stuck recovery")
+        Runtime.Status="Stuck 4 min: hopping server"
+        HopHiddenServer("4 minute stuck recovery")
     end
 end
 
@@ -9205,7 +9330,7 @@ local function refreshInterface()
 
     CurrentQuest.Text = tostring(HiddenEvent.current or (progress >= 39 and "The Finale" or "No active quest"))
     CurrentStep.Text = tostring(HiddenEvent.step or Runtime.Step or "Waiting for a task")
-    StatusText.Text = tostring(Runtime.Status or "Ready")
+    StatusText.Text = tostring(Runtime.Status or "Ready") .. (Runtime.Diag and ("\n" .. Runtime.Diag) or "")
     StartButton.Text = Settings["Auto Secret Quest"] and "Stop automation" or "Start automation"
     StartButton.BackgroundColor3 = Settings["Auto Secret Quest"] and Colors.Danger or Colors.AccentDark
 
@@ -9272,7 +9397,22 @@ task.spawn(function()
                 Runtime.LastTrace = tostring(e) .. "\n" .. tostring(debug.traceback())
                 return e
             end)
-            if not ok then
+            if ok then
+                Runtime.ErrStreak = 0
+            else
+                Runtime.ErrStreak = (Runtime.ErrStreak or 0) + 1
+                local failing = HiddenEvent.current
+                if failing then
+                    HiddenEvent.skipped[failing] = tick() + 120
+                    HiddenEvent.current = nil
+                    pcall(UnlockHiddenTask, failing, "error")
+                end
+                pcall(cancelTween)
+                pcall(HiddenRelease)
+                if Runtime.ErrStreak >= 8 then
+                    Runtime.ErrStreak = 0
+                    pcall(HopHiddenServer, "Repeated errors, changing server")
+                end
                 Runtime.Status="ERROR: "..tostring(err):sub(1,130)
                 if Runtime.LastErrorShown ~= tostring(err) then
                     Runtime.LastErrorShown = tostring(err)

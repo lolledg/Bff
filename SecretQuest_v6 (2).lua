@@ -49,22 +49,22 @@ sharedEnv.SecretQuestJobLock = currentJobId
 sharedEnv.SecretQuestLoaded = true
 sharedEnv.SecretQuestJobId = currentJobId
 
--- Quick check for Data/Main; skip the long wait if already present, else wait up to 8s
+-- Wait for Data + Main + Remotes all at once (no fixed delays)
 do
     local playerGui = localPlayer:FindFirstChildOfClass("PlayerGui")
-        or localPlayer:WaitForChild("PlayerGui", 5)
-    if not (localPlayer:FindFirstChild("Data") and playerGui and playerGui:FindFirstChild("Main")) then
-        local deadline = tick() + 8
-        while tick() < deadline do
-            if localPlayer:FindFirstChild("Data") and playerGui and playerGui:FindFirstChild("Main") then
-                break
-            end
-            task.wait(0.1)
+        or localPlayer:WaitForChild("PlayerGui", 10)
+    local deadline = tick() + 30
+    while tick() < deadline do
+        if localPlayer:FindFirstChild("Data")
+            and playerGui and playerGui:FindFirstChild("Main")
+            and ReplicatedStorage:FindFirstChild("Remotes") then
+            break
         end
+        task.wait(0.1)
     end
 end
 
-local CommF = ReplicatedStorage:WaitForChild("Remotes", 10):WaitForChild("CommF_", 10)
+local CommF = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CommF_")
 
 -- Suppress the blue-screen effect that Observation/Ken puts in Lighting.
 -- The ObservationManager:refresh() adds a Blur and a ColorCorrection every frame;

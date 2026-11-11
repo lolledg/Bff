@@ -66,6 +66,23 @@ end
 
 local CommF = ReplicatedStorage:WaitForChild("Remotes", 10):WaitForChild("CommF_", 10)
 
+-- Remove the Blur/screen effects that ken/observation puts in Lighting
+-- Hook ChildAdded so any future Blur is also removed immediately
+local function removeKenBlur()
+    for _, child in ipairs(Lighting:GetChildren()) do
+        if child:IsA("BlurEffect") or child:IsA("ColorCorrectionEffect") or child.ClassName == "Blur" then
+            pcall(function() child.Enabled = false end)
+            pcall(function() child.Size = 0 end)
+        end
+    end
+end
+Lighting.ChildAdded:Connect(function(child)
+    if child:IsA("BlurEffect") or child:IsA("ColorCorrectionEffect") or child.ClassName == "Blur" then
+        pcall(function() child.Enabled = false end)
+        pcall(function() child.Size = 0 end)
+    end
+end)
+
 getgc = getgc or function() return {} end
 islclosure = islclosure or function() return false end
 getupvalues = getupvalues or (debug and debug.getupvalues) or function() return {} end
@@ -282,10 +299,22 @@ local function EnsureSelectedTeam(force)
 end
 
 task.spawn(function()
-    task.wait(0.5)
+    -- Try immediately; keep retrying until team is set, then switch to a slow background loop
+    local playerGui = localPlayer:FindFirstChildOfClass("PlayerGui")
+    local function dataReady()
+        return localPlayer:FindFirstChild("Data")
+            and playerGui and playerGui:FindFirstChild("Main")
+    end
+    -- Fast loop until team confirmed or data never loads (max 15s)
+    local deadline = tick() + 15
+    while tick() < deadline do
+        if EnsureSelectedTeam(false) then break end
+        task.wait(0.3)
+    end
+    -- Slow background loop to re-apply if team gets reset (e.g. respawn, server hop)
     while true do
-        EnsureSelectedTeam(false)
         task.wait(2)
+        EnsureSelectedTeam(false)
     end
 end)
 

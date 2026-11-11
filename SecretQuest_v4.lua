@@ -24,18 +24,18 @@ SQToast = function(text, dur)
     end)
 end
 
--- Autoexec safety: wait until the game and the local player are really ready
-if not game:IsLoaded() then
-    game.Loaded:Wait()
-end
-do
-    local plrs = game:GetService("Players")
-    while not plrs.LocalPlayer do
-        task.wait(0.1)
-    end
-end
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local VirtualUser = game:GetService("VirtualUser")
+local CollectionService = game:GetService("CollectionService")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local Lighting = game:GetService("Lighting")
 
-SQToast("Script started, waiting for the game...", 5)
+local localPlayer = Players.LocalPlayer or Players:GetPropertyChangedSignal("LocalPlayer"):Wait() and Players.LocalPlayer
 
 local sharedEnv = (type(getgenv) == "function" and getgenv()) or _G
 local currentJobId = tostring(game.JobId)
@@ -49,32 +49,22 @@ sharedEnv.SecretQuestJobLock = currentJobId
 sharedEnv.SecretQuestLoaded = true
 sharedEnv.SecretQuestJobId = currentJobId
 
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService = game:GetService("TweenService")
-local RunService = game:GetService("RunService")
-local VirtualInputManager = game:GetService("VirtualInputManager")
-local VirtualUser = game:GetService("VirtualUser")
-local CollectionService = game:GetService("CollectionService")
-local HttpService = game:GetService("HttpService")
-local TeleportService = game:GetService("TeleportService")
-local Lighting = game:GetService("Lighting")
-
-local localPlayer = Players.LocalPlayer
-
--- Blox Fruits needs a few seconds to build Data / Main GUI after joining
+-- Quick check for Data/Main; skip the long wait if already present, else wait up to 8s
 do
-    local startWait = tick()
-    local playerGui = localPlayer:WaitForChild("PlayerGui", 30)
-    while tick() - startWait < 45 do
-        if localPlayer:FindFirstChild("Data") and playerGui and playerGui:FindFirstChild("Main") then
-            break
+    local playerGui = localPlayer:FindFirstChildOfClass("PlayerGui")
+        or localPlayer:WaitForChild("PlayerGui", 5)
+    if not (localPlayer:FindFirstChild("Data") and playerGui and playerGui:FindFirstChild("Main")) then
+        local deadline = tick() + 8
+        while tick() < deadline do
+            if localPlayer:FindFirstChild("Data") and playerGui and playerGui:FindFirstChild("Main") then
+                break
+            end
+            task.wait(0.1)
         end
-        task.wait(0.25)
     end
-    task.wait(1.5)
 end
-local CommF = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CommF_")
+
+local CommF = ReplicatedStorage:WaitForChild("Remotes", 10):WaitForChild("CommF_", 10)
 
 getgc = getgc or function() return {} end
 islclosure = islclosure or function() return false end

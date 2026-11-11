@@ -49,23 +49,20 @@ local Lighting = game:GetService("Lighting")
 
 local localPlayer = Players.LocalPlayer
 
--- Wait for Data + PlayerGui/Main + Remotes without any fixed delay
-do
-    local playerGui = localPlayer:FindFirstChildOfClass("PlayerGui")
-        or localPlayer:WaitForChild("PlayerGui", 10)
-    local deadline = tick() + 30
-    while tick() < deadline do
-        if localPlayer:FindFirstChild("Data")
-            and playerGui and playerGui:FindFirstChild("Main")
-            and ReplicatedStorage:FindFirstChild("Remotes") then
-            break
-        end
-        task.wait(0.1)
-    end
-end
+-- ── Instant startup: nothing waits for Data. Only the Remotes are needed to pick the team;
+-- the team remote is fired first, and Data is loaded afterwards in the background.
 local CommF = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CommF_")
 
--- Suppress blue-screen from Ken/Observation: hook every Blur/ColorCorrection added to Lighting
+-- ── PhysicsRepRootPart hook (needed for instant travel) ──────────────────────
+local _realSHP = sethiddenproperty
+sethiddenproperty = newcclosure and newcclosure(function(obj, prop, val)
+    if prop == "PhysicsRepRootPart" then
+        return _realSHP(obj, "PhysicsRepRootRef", InstanceHandle.new(val))
+    end
+    return _realSHP(obj, prop, val)
+end) or sethiddenproperty
+
+-- ── Suppress blue-screen from Ken/Observation ────────────────────────────────
 local _hookedFX = {}
 local function _hookFX(child)
     if _hookedFX[child] then return end
@@ -81,8 +78,7 @@ local function _hookFX(child)
             end
         end)
     end
-    _zero()
-    child.Changed:Connect(_zero)
+    _zero(); child.Changed:Connect(_zero)
 end
 for _, c in ipairs(Lighting:GetChildren()) do _hookFX(c) end
 Lighting.ChildAdded:Connect(_hookFX)
@@ -106,7 +102,7 @@ getconnections = getconnections or function() return {} end
 
 -- Runtime and saved preferences
 local Runtime = {
-    Version = "1.0.0",
+    Version = "1.2.0",
     Enabled = false,
     Mode = "IDLE",
     Step = "Idle",
@@ -141,6 +137,18 @@ local Settings = {
     ["Auto Turn On Observation"] = true,
     ["Auto Turn On V3"] = true,
     ["Auto Turn On V4"] = true,
+}
+
+-- All the "how long do we wait before hopping" numbers in one place (seconds)
+SQ_TUNING = {
+    ScoutsBeforeHop = 2,    -- how many 'not here' scouts in one server before hopping
+    ScoutWindow = 4,        -- after teleporting to a quest's island: how long to wait for the quest/boss to show up
+    IdleHop = 2,            -- nothing to do in this server -> hop after this
+    HopCooldown = 8,        -- minimum time between two hop requests
+    DeadHourDelay = 0.3,    -- dead hour (min 50-58): hop this fast when nothing is needed here
+    DeadHourStartSec = 2,   -- ignore the first seconds of minute 50 (let the hint load)
+    WaitHop = 30,           -- stuck in a "waiting..." step this long -> hop
+    ArriveRadius = 45,      -- instant scout counts as arrived inside this radius
 }
 
 local Config = {
@@ -296,30 +304,39 @@ FormatMagnetTime = function(seconds)
     return string.format("%02d:%02d", m, s)
 end
 
-local teamSelectionAttempted = false
--- Team selection
+local lastTeamTry = 0
+-- Team selection (fired immediately, retried every 1.5s until the game accepts it)
 local function EnsureSelectedTeam(force)
     local current = localPlayer and localPlayer.Team and localPlayer.Team.Name or nil
     if current == "Pirates" or current == "Marines" then
         return true
     end
-    if teamSelectionAttempted and not force then
+    if not force and tick() - lastTeamTry < 1.5 then
         return false
     end
-
-    teamSelectionAttempted = true
-    local ok = pcall(function()
-        CommF:InvokeServer("SetTeam", Settings["Select Team"])
+    lastTeamTry = tick()
+    task.spawn(function() -- never block on a remote that does not answer
+        pcall(function()
+            CommF:InvokeServer("SetTeam", Settings["Select Team"])
+        end)
     end)
-    return ok
+    return false
 end
 
+-- 1) team remote first  2) then wait for Data / Main in the background
+Runtime.DataReady = false
 task.spawn(function()
-    task.wait(0.5)
-    while true do
-        EnsureSelectedTeam(false)
-        task.wait(2)
+    local started = tick()
+    while tick() - started < 60 do
+        local hasTeam = EnsureSelectedTeam(false)
+        local pg = localPlayer:FindFirstChildOfClass("PlayerGui")
+        if hasTeam and localPlayer:FindFirstChild("Data") and pg and pg:FindFirstChild("Main") then
+            break
+        end
+        task.wait(0.2)
     end
+    Runtime.DataReady = true
+    if SQToast then SQToast("Team + data ready", 3) end
 end)
 
 -- Character movement and travel
@@ -965,6 +982,61 @@ local function startProxyTween(goal,speed)
     return true
 end
 
+-- ── Instant travel via PhysicsRepRootPart (SCOUTING ONLY) ───────────────────
+-- Used to jump to a quest island/target and check whether the boss / quest is there.
+-- It always detaches afterwards. Returns true only if the character really arrived.
+local scoutBusy = false
+local function _instantTravel(goalCF)
+    goalCF = SafeCFrame(goalCF)
+    if not goalCF or scoutBusy then return false end
+    if type(_realSHP) ~= "function" or not InstanceHandle then return false end
+
+    local c = localPlayer.Character
+    local hrp = c and c:FindFirstChild("HumanoidRootPart")
+    local hum = c and c:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum or hum.Health <= 0 then return false end
+
+    scoutBusy = true
+    pcall(stopMove, false) -- no tween may fight the teleport
+
+    local anchor = Instance.new("Part")
+    anchor.Name = "SQ_TravelAnchor"
+    anchor.Anchored = true
+    anchor.CanCollide = false
+    anchor.CanTouch = false
+    anchor.Transparency = 1
+    anchor.Size = Vector3.one
+    anchor.CFrame = goalCF
+    anchor.Parent = workspace
+
+    local function stick()
+        pcall(_realSHP, hrp, "PhysicsRepRootRef", InstanceHandle.new(anchor))
+        hrp.CFrame = goalCF
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end
+
+    local function detach()
+        pcall(_realSHP, hrp, "PhysicsRepRootRef", nil)
+        pcall(function()
+            hrp.Anchored = false
+            hrp.AssemblyLinearVelocity = Vector3.zero
+        end)
+        pcall(function() anchor:Destroy() end)
+    end
+
+    local ok = pcall(function()
+        stick(); task.wait()
+        stick(); task.wait()
+    end)
+    detach() -- ALWAYS remove the attach, even if something above errored
+    scoutBusy = false
+
+    if not ok or not hrp.Parent then return false end
+    task.wait(0.1)
+    return (hrp.Position - goalCF.Position).Magnitude <= SQ_TUNING.ArriveRadius
+end
+
 ToTarget=function(goal,speed)
     goal=SafeCFrame(goal)
     if not goal then
@@ -1607,16 +1679,27 @@ end
         HiddenEvent.anchored = nil
     end
 
-    HiddenMove = function(arg)
+    -- scout = true  -> instant jump (only to check if the boss / quest is there), tween fallback
+    -- scout = false -> normal, stable tween travel (everything that actually does the quest)
+    HiddenMove = function(arg, scout)
         HiddenRelease()
 
         local goal = SafeCFrame(arg)
-        if goal and Settings["Auto Secret Quest"] then
-            ToTarget(goal)
+        if not goal or not Settings["Auto Secret Quest"] then return end
+
+        if scout then
+            Runtime.Status = "Scouting target"
+            local okCall, arrived = pcall(_instantTravel, goal)
+            if okCall and arrived then
+                return true
+            end
+            -- instant travel unavailable or did not land: fall through to the normal travel
         end
+
+        return ToTarget(goal)
     end
 
-    HiddenGoTo = function(arg, arg2)
+    HiddenGoTo = function(arg, arg2, scout)
         if typeof(arg) == "CFrame" then
             arg = arg.Position
         end
@@ -1626,7 +1709,7 @@ end
         if localPlayer:DistanceFromCharacter(arg) <= (arg2 or 8) then
             return true
         end
-        HiddenMove(CFrame.new(arg))
+        HiddenMove(CFrame.new(arg), scout)
         return false
     end
 
@@ -1654,7 +1737,7 @@ end
         end
 
         HiddenEvent.travelTarget = position + Vector3.new(0, 30, 0)
-        return HiddenGoTo(position + Vector3.new(0, 30, 0), 150)
+        return HiddenGoTo(position + Vector3.new(0, 30, 0), 150, true)
     end
 
     HiddenHold = function(arg)
@@ -7516,7 +7599,7 @@ if v11.stage == "Pickup" and v11.pickup then
                         HiddenEvent.islandArrived = HiddenEvent.islandArrived or tick()
                         local islandArrived = HiddenEvent.islandArrived
 
-                        if tick() - islandArrived > 8 then
+                        if tick() - islandArrived > SQ_TUNING.ScoutWindow then
                             HiddenEvent.islandArrived = nil
 
                             if v8.HintIsland then
@@ -7530,6 +7613,19 @@ if v11.stage == "Pickup" and v11.pickup then
                             UnlockHiddenTask(v8.Name, "moment not loaded")
                             HiddenEvent.current = nil
                             HiddenNotify(HiddenEvent.waiting[v8.Name] .. " yet, checking again later", v8.Name .. "notloaded", "warning")
+
+                            -- scouted the target and nothing is there: don't waste time, change server
+                            HiddenEvent.negScouts = (HiddenEvent.negScouts or 0) + 1
+                            if Settings["Hop Until Quest"] and not Runtime.HopInProgress
+                                and HiddenEvent.negScouts >= SQ_TUNING.ScoutsBeforeHop
+                                and not IsHiddenTaskLockValid(GetHiddenProgress())
+                                and tick() - (HiddenEvent.hopAt or 0) >= SQ_TUNING.HopCooldown then
+                                HiddenEvent.hopAt = tick()
+                                if HopHiddenServer("Scouted " .. tostring(v8.Island) .. ": " .. v8.Name .. " is not here") then
+                                    SetHiddenStep("Not here, hopping to another server")
+                                    return
+                                end
+                            end
                         end
                     else
                         HiddenEvent.islandArrived = nil
@@ -7632,7 +7728,7 @@ local min = UTCNow().min
             HiddenEvent.deadHourIdleSince = HiddenEvent.deadHourIdleSince or tick()
             local deadIdle = tick() - HiddenEvent.deadHourIdleSince
 
-            if deadIdle >= 1 and tick() - (HiddenEvent.hopAt or 0) >= 3 then
+            if deadIdle >= SQ_TUNING.DeadHourDelay and tick() - (HiddenEvent.hopAt or 0) >= 2 then
                 HiddenEvent.hopAt = tick()
                 HiddenEvent.deadHourIdleSince = nil
 
@@ -7660,7 +7756,7 @@ local min = UTCNow().min
             HiddenEvent.questHopSince = HiddenEvent.questHopSince or nowT
             local idleFor = nowT - HiddenEvent.questHopSince
 
-            if idleFor >= 12 and nowT - (HiddenEvent.hopAt or 0) >= 15 then
+            if idleFor >= SQ_TUNING.IdleHop and nowT - (HiddenEvent.hopAt or 0) >= SQ_TUNING.HopCooldown then
                 HiddenEvent.hopAt = nowT
                 HiddenEvent.questHopSince = nil
                 print("[SecretQuest][HopUntilQuest] nothing available here -> HOP")
@@ -7669,7 +7765,7 @@ local min = UTCNow().min
                     return
                 end
             else
-                SetHiddenStep("Hop-until-quest | no quest here | hop in " .. math.max(0, math.ceil(12 - idleFor)) .. "s")
+                SetHiddenStep("Hop-until-quest | no quest here | hop in " .. math.max(0, math.ceil(SQ_TUNING.IdleHop - idleFor)) .. "s")
             end
         end
 
@@ -7892,6 +7988,23 @@ HopHiddenServer = function(reason)
         end
     end
 
+    -- run fn in its own thread and give up after `seconds` (a remote / HttpGet that never answers must not freeze the hop)
+    local function runWithTimeout(fn, seconds)
+        local done, ok, res = false, false, nil
+        task.spawn(function()
+            ok, res = pcall(fn)
+            done = true
+        end)
+        local t0 = os.clock()
+        while not done and os.clock() - t0 < seconds do
+            task.wait(0.05)
+        end
+        if not done then
+            return false, nil
+        end
+        return ok, res
+    end
+
     local function GetPublicServers(cursor)
         local url =
             "https://games.roblox.com/v1/games/"
@@ -7903,13 +8016,13 @@ HopHiddenServer = function(reason)
         end
 
         local body
-        local okGet, res = pcall(function() return game:HttpGet(url) end)
+        local okGet, res = runWithTimeout(function() return game:HttpGet(url) end, 8)
         if okGet and type(res) == "string" and res ~= "" then
             body = res
         else
             local req = (syn and syn.request) or http_request or request or (fluxus and fluxus.request)
             if type(req) == "function" then
-                local okReq, response = pcall(req, {Url = url, Method = "GET"})
+                local okReq, response = runWithTimeout(function() return req({Url = url, Method = "GET"}) end, 8)
                 if okReq and type(response) == "table" then
                     if response.StatusCode == 200 then
                         body = response.Body
@@ -8000,9 +8113,9 @@ HopHiddenServer = function(reason)
         if not browser then
             return nil
         end
-        local ok, list = pcall(function()
+        local ok, list = runWithTimeout(function()
             return browser:InvokeServer(1)
-        end)
+        end, 6)
         if not ok or type(list) ~= "table" then
             return nil
         end
@@ -8050,26 +8163,24 @@ HopHiddenServer = function(reason)
             Runtime.Status = ("Hop public server %d/8"):format(attempts)
             print("[SecretQuest] public hop ->", targetId, reason or "")
 
-            local sent = pcall(function()
-                local serverBrowser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
-                if serverBrowser then
-
-                    serverBrowser:InvokeServer("teleport", targetId)
-                else
-                    TeleportService:TeleportToPlaceInstance(game.PlaceId, targetId, localPlayer)
-                end
+            -- fire the teleport in its own thread: InvokeServer may never return
+            task.spawn(function()
+                pcall(function()
+                    local serverBrowser = ReplicatedStorage:FindFirstChild("__ServerBrowser")
+                    if serverBrowser then
+                        serverBrowser:InvokeServer("teleport", targetId)
+                    else
+                        TeleportService:TeleportToPlaceInstance(game.PlaceId, targetId, localPlayer)
+                    end
+                end)
             end)
-
-            if not sent then
-                Runtime.Status = "Hop request failed; trying another public server"
-            end
 
             -- teleports take several seconds; only give up early if Roblox reports a failure
             local teleportFailed = false
             local failConn = TeleportService.TeleportInitFailed:Connect(function()
                 teleportFailed = true
             end)
-            local deadline = os.clock() + 20
+            local deadline = os.clock() + 12
             while Runtime.HopInProgress
                 and game.JobId == startJobId
                 and os.clock() < deadline
@@ -8144,6 +8255,9 @@ SQTravelWatchdog = function(quest, arrived)
             HE.travelKey = nil
             HiddenNotify("Could not travel to " .. tostring(quest.Island) .. " (not moving), skipping " .. quest.Name,
                 "stucktravel" .. quest.Name, "warning")
+            if Settings["Hop Until Quest"] then
+                HopHiddenServer("Travel to " .. tostring(quest.Island) .. " is stuck")
+            end
             return true
         end
     end
@@ -8161,7 +8275,7 @@ task.spawn(function()
                 return
             end
             local t = UTCNow()
-            if t.min < 50 or t.min > 58 or (t.min == 50 and t.sec < 15) then
+            if t.min < 50 or t.min > 58 or (t.min == 50 and t.sec < SQ_TUNING.DeadHourStartSec) then
                 deadSince = nil
                 return
             end
@@ -8184,9 +8298,41 @@ task.spawn(function()
                 return
             end
             deadSince = deadSince or os.clock()
-            if os.clock() - deadSince >= 1 and os.clock() - lastHop >= 3 then
+            if os.clock() - deadSince >= SQ_TUNING.DeadHourDelay and os.clock() - lastHop >= 2 then
                 lastHop, deadSince = os.clock(), nil
                 HopHiddenServer("Dead hour: no needed awakened boss in this server")
+            end
+        end)
+    end
+end)
+
+-- "Waiting..." watcher: hop instead of sitting in a waiting step
+task.spawn(function()
+    local waitStart
+    while task.wait(1) do
+        pcall(function()
+            if not Settings["Auto Secret Quest"] or not Settings["Hop Until Quest"] or Runtime.HopInProgress
+                or not Runtime.DataReady or SecretQuestAutoSCProgressSea() ~= 1 then
+                waitStart = nil
+                return
+            end
+            local step = string.lower(tostring(HiddenEvent.step or ""))
+            local waiting = step:find("waiting", 1, true) or step:find("not up", 1, true)
+                or step:find("stirs on", 1, true) or step:find("needs time", 1, true)
+            if not waiting or HiddenEvent.fighting then
+                waitStart = nil
+                return
+            end
+            local progress = GetHiddenProgress()
+            if CountSecretDone(progress) >= 39 or IsHiddenTaskLockValid(progress)
+                or FindNeededAwakenedQuest(progress, GetHiddenRaidHint()) then
+                waitStart = nil
+                return
+            end
+            waitStart = waitStart or os.clock()
+            if os.clock() - waitStart >= SQ_TUNING.WaitHop then
+                waitStart = nil
+                HopHiddenServer("Waiting too long in this server; hopping to find a quest")
             end
         end)
     end
@@ -8567,8 +8713,12 @@ end
 
 local BaseAutoHiddenEvent=AutoHiddenEvent
 AutoHiddenEvent=function()
+    if not Runtime.DataReady then
+        Runtime.Status = "Loading team and data..."
+        return
+    end
     if Runtime.HopInProgress then
-        if tick() - (Runtime.HopStartedAt or tick()) > 150 then
+        if tick() - (Runtime.HopStartedAt or tick()) > 70 then
             Runtime.HopInProgress = false
             Runtime.Status = "Hop timed out, resuming quests"
         else

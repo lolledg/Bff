@@ -66,21 +66,48 @@ end
 
 local CommF = ReplicatedStorage:WaitForChild("Remotes", 10):WaitForChild("CommF_", 10)
 
--- Remove the Blur/screen effects that ken/observation puts in Lighting
--- Hook ChildAdded so any future Blur is also removed immediately
-local function removeKenBlur()
-    for _, child in ipairs(Lighting:GetChildren()) do
-        if child:IsA("BlurEffect") or child:IsA("ColorCorrectionEffect") or child.ClassName == "Blur" then
-            pcall(function() child.Enabled = false end)
-            pcall(function() child.Size = 0 end)
+-- Suppress the blue-screen effect that Observation/Ken puts in Lighting.
+-- The ObservationManager:refresh() adds a Blur and a ColorCorrection every frame;
+-- we kill them on ChildAdded AND wipe any already present, then hook the GC object
+-- so its internal blur/colorCorrection fields are neutered.
+local function killLightingEffect(child)
+    pcall(function()
+        if child:IsA("BlurEffect") then
+            child.Size = 0
+            child.Enabled = false
+        elseif child:IsA("ColorCorrectionEffect") then
+            child.Brightness = 0
+            child.Contrast  = 0
+            child.Saturation = 0
+            child.TintColor  = Color3.new(1,1,1)
+            child.Enabled    = false
         end
-    end
+    end)
 end
-Lighting.ChildAdded:Connect(function(child)
-    if child:IsA("BlurEffect") or child:IsA("ColorCorrectionEffect") or child.ClassName == "Blur" then
-        pcall(function() child.Enabled = false end)
-        pcall(function() child.Size = 0 end)
-    end
+-- Kill anything already in Lighting
+for _, child in ipairs(Lighting:GetChildren()) do killLightingEffect(child) end
+-- Kill anything added later (ObservationManager adds them on first refresh)
+Lighting.ChildAdded:Connect(killLightingEffect)
+-- Also null out the blur/cc fields on the ObservationManager GC table so refresh() is a no-op for visuals
+task.defer(function()
+    local ok = pcall(function()
+        for _, v in ipairs(getgc(false)) do
+            if type(v) == "table" then
+                local b = rawget(v, "blur")
+                local cc = rawget(v, "colorCorrection")
+                if b and typeof(b) == "Instance" and b:IsA("BlurEffect") then
+                    b.Size    = 0
+                    b.Enabled = false
+                end
+                if cc and typeof(cc) == "Instance" and cc:IsA("ColorCorrectionEffect") then
+                    cc.Brightness = 0
+                    cc.Contrast   = 0
+                    cc.Saturation = 0
+                    cc.Enabled    = false
+                end
+            end
+        end
+    end)
 end)
 
 getgc = getgc or function() return {} end
@@ -1349,8 +1376,21 @@ local function HasBusoOn()
 end
 
 local function ObservationOn()
-    local blur = Lighting:FindFirstChild("Blur")
-    return blur and blur.Enabled or false
+    -- Check the ObservationManager active state via GC instead of the Blur
+    -- (we disable Blur to avoid the blue screen, so it's no longer a reliable signal)
+    local ok, result = pcall(function()
+        for _, v in ipairs(getgc(false)) do
+            if type(v) == "table" then
+                local active = rawget(v, "active")
+                local radius = rawget(v, "radius")
+                if type(active) == "boolean" and type(radius) == "number" then
+                    return active
+                end
+            end
+        end
+        return false
+    end)
+    return ok and result or false
 end
 
 local function TurnOnV3()
